@@ -154,6 +154,3 @@ def get_current_frame_number(cap: cv2.VideoCapture) -> int:
         Current frame number
     """
     return int(cap.get(cv2.CAP_PROP_POS_FRAMES))
-
-
-# Made with Bob
