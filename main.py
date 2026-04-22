@@ -9,6 +9,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 from cv2.typing import MatLike
+from joblib import Parallel, delayed
 from sgfmill import sgf
 
 from src import (
@@ -30,6 +31,7 @@ from src.utils.cv2_helper import (
     blur_and_sharpen,
     convert_to_top_down,
     default_corners,
+    get_perspective_transform_matrix,
 )
 from src.utils.game import Cell, Game
 from src.utils.katago_helper import get_best_variation, start_katago_process
@@ -118,7 +120,21 @@ def try_to_load_corners_from_file() -> list[list[int]] | None:
         return json.load(f)
 
 
-def classify_all_cells(model, frame: MatLike) -> list[Cell]:
+def classify_all_cells(
+    model, frame: MatLike, use_parallel: bool = True, n_jobs: int = -1
+) -> list[Cell]:
+    """
+    Classify all 361 cells on the Go board.
+
+    Args:
+        model: Trained Random Forest model
+        frame: Transformed board image
+        use_parallel: Use parallel processing (default: True)
+        n_jobs: Number of parallel jobs (-1 = all CPUs, default: -1)
+
+    Returns:
+        List of Cell classifications
+    """
     low_offsets = np.arange(0, GRID_SIZE) * CELL_SIZE - HALF_CELL_SIZE
     high_offsets = np.arange(1, GRID_SIZE + 1) * CELL_SIZE + HALF_CELL_SIZE
 
@@ -138,7 +154,25 @@ def classify_all_cells(model, frame: MatLike) -> list[Cell]:
         ]
     )
 
-    results = model.predict(cells)
+    if use_parallel and n_jobs != 1:
+        # Split cells into batches for parallel processing
+        # Optimal batch size: balance overhead vs parallelization
+        batch_size = max(
+            1, len(cells) // (abs(n_jobs) if n_jobs > 0 else os.cpu_count() or 4)
+        )
+        batches = [cells[i : i + batch_size] for i in range(0, len(cells), batch_size)]
+
+        # Parallel prediction across batches
+        batch_results = Parallel(n_jobs=n_jobs, prefer="threads")(
+            delayed(model.predict)(batch) for batch in batches
+        )
+
+        # Flatten results
+        results = np.concatenate(batch_results)
+    else:
+        # Sequential prediction (original behavior)
+        results = model.predict(cells)
+
     results = [Cell(r) for r in results]
 
     return results
@@ -248,6 +282,20 @@ def get_args() -> argparse.Namespace:
         help="Process every Nth frame in video mode (default: 10). Lower = slower but more accurate. Only used with --video-mode",
     )
     parser.add_argument(
+        "--parallel-jobs",
+        type=int,
+        default=-1,
+        dest="parallel_jobs",
+        help="Number of parallel jobs for classification (default: -1 = all CPUs). Set to 1 to disable parallelization",
+    )
+    parser.add_argument(
+        "--display-skip",
+        type=int,
+        default=1,
+        dest="display_skip",
+        help="Display every Nth processed frame (default: 1 = every frame). Higher values reduce display overhead",
+    )
+    parser.add_argument(
         "--use-saved-corners",
         action="store_true",
         default=False,
@@ -344,7 +392,12 @@ def process_video_file(
         corners = setup_corners(temp_cap)
         cap.set(cv2.CAP_PROP_POS_FRAMES, 0)  # Reset to beginning
 
+    # Pre-compute perspective transformation matrix for performance
+    transform_matrix = get_perspective_transform_matrix(corners)
+
+    # Use circular buffer with numpy arrays for better performance
     last_results = []
+    display_counter = 0
 
     paused = False
     recalibrating = False
@@ -408,6 +461,8 @@ def process_video_file(
 
                 temp_cap = VideoFrameCapture(frame)
                 corners = setup_corners(temp_cap)
+                # Recompute transformation matrix after recalibration
+                transform_matrix = get_perspective_transform_matrix(corners)
                 reference_frame = frame.copy()
                 recalibrating = False
                 logger.info("Corners recalibrated. Press 'r' to resume.")
@@ -453,27 +508,32 @@ def process_video_file(
             cv2.imshow("Video Processing", display_frame)
             continue
 
-        # Process frame (same logic as camera mode)
-        image = convert_to_top_down(frame, corners)
+        # Process frame - use cached transformation matrix
+        image = convert_to_top_down(frame, matrix=transform_matrix)
         image = blur_and_sharpen(image)
-        classified_cells = classify_all_cells(model, image)
+        classified_cells = classify_all_cells(model, image, n_jobs=args.parallel_jobs)
 
-        last_results.append(classified_cells)
+        # Convert to numpy array for faster comparison
+        classified_array = np.array([cell.value for cell in classified_cells])
+        last_results.append(classified_array)
 
-        canvas = add_stones_to_visual(visual_board.copy(), game.board)
-        complete = np.hstack((image, canvas))
+        # Display only every Nth processed frame to reduce overhead
+        display_counter += 1
+        if display_counter % args.display_skip == 0:
+            canvas = add_stones_to_visual(visual_board.copy(), game.board)
+            complete = np.hstack((image, canvas))
 
-        # Add frame counter
-        cv2.putText(
-            complete,
-            f"Frame: {current_frame_num}/{video_info['frame_count']}",
-            (10, 30),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
-            (255, 255, 255),
-            2,
-        )
-        cv2.imshow("Video Processing", complete)
+            # Add frame counter
+            cv2.putText(
+                complete,
+                f"Frame: {current_frame_num}/{video_info['frame_count']}",
+                (10, 30),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (255, 255, 255),
+                2,
+            )
+            cv2.imshow("Video Processing", complete)
 
         if len(last_results) < args.identical_frames:
             continue
@@ -482,8 +542,12 @@ def process_video_file(
 
         current_player, opponent_player = game.current_and_opponent_color()
 
-        if not all(r == classified_cells for r in last_results):
+        # Use numpy array comparison for faster checking
+        if not all(np.array_equal(r, classified_array) for r in last_results):
             continue
+
+        # Convert back to Cell objects for game logic
+        classified_cells = [Cell(v) for v in classified_array]
 
         changes = diff_between_boards(game.board, classified_cells)
 
@@ -627,6 +691,17 @@ def main() -> None:
 
         logger.info(f"Frame skip: processing every {args.frame_skip} frames")
 
+        # Log parallel processing settings
+        if args.parallel_jobs == 1:
+            logger.info("Parallel processing: disabled")
+        elif args.parallel_jobs == -1:
+            cpu_count = os.cpu_count() or 1
+            logger.info(f"Parallel processing: enabled (using all {cpu_count} CPUs)")
+        else:
+            logger.info(
+                f"Parallel processing: enabled (using {args.parallel_jobs} jobs)"
+            )
+
         video_files = get_video_files(video_path)
         if not video_files:
             logger.error(f"No video files found in {video_path}")
@@ -719,7 +794,11 @@ def main() -> None:
 
     visual_board = base_visual_board()
 
+    # Pre-compute perspective transformation matrix for performance
+    transform_matrix = get_perspective_transform_matrix(corners)
+
     last_results = []
+    display_counter = 0
 
     # handles game logic
     game = Game()
@@ -735,15 +814,21 @@ def main() -> None:
             break
 
         _, frame = cap.read()
-        image = convert_to_top_down(frame, corners)
+        # Use cached transformation matrix
+        image = convert_to_top_down(frame, matrix=transform_matrix)
         image = blur_and_sharpen(image)
-        classified_cells = classify_all_cells(model, image)
+        classified_cells = classify_all_cells(model, image, n_jobs=args.parallel_jobs)
 
-        last_results.append(classified_cells)
+        # Convert to numpy array for faster comparison
+        classified_array = np.array([cell.value for cell in classified_cells])
+        last_results.append(classified_array)
 
-        canvas = add_stones_to_visual(visual_board.copy(), game.board)
-        complete = np.hstack((image, canvas))  # type: ignore #
-        cv2.imshow("Complete", complete)
+        # Display only every Nth frame to reduce overhead
+        display_counter += 1
+        if display_counter % args.display_skip == 0:
+            canvas = add_stones_to_visual(visual_board.copy(), game.board)
+            complete = np.hstack((image, canvas))  # type: ignore #
+            cv2.imshow("Complete", complete)
 
         # last_results are empty at the start and have to be filled up at the start
         # this initialisation process is ignored and the recording only starts
@@ -755,9 +840,12 @@ def main() -> None:
 
         current_player, opponent_player = game.current_and_opponent_color()
 
-        # not all the same => movement exists
-        if not all(r == classified_cells for r in last_results):
+        # Use numpy array comparison for faster checking
+        if not all(np.array_equal(r, classified_array) for r in last_results):
             continue
+
+        # Convert back to Cell objects for game logic
+        classified_cells = [Cell(v) for v in classified_array]
 
         changes = diff_between_boards(game.board, classified_cells)
 
